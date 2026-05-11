@@ -4,16 +4,10 @@ Embedder for NEXUS
 Generates embeddings using sentence-transformers (local).
 """
 
-from typing import List, Optional, Union
-import numpy as np
-from loguru import logger
+from typing import List, Optional
 
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_SENTENCE_TRANSFORMERS = True
-except ImportError:
-    HAS_SENTENCE_TRANSFORMERS = False
-    logger.warning("sentence-transformers not installed. Install with: pip install sentence-transformers")
+from sentence_transformers import SentenceTransformer
+from tqdm import tqdm
 
 from config import settings
 
@@ -25,6 +19,8 @@ class Embedder:
     Uses the configured embedding model (default: all-MiniLM-L6-v2)
     which produces 384-dimensional vectors.
     """
+
+    BATCH_SIZE = 128
 
     def __init__(self, model_name: str = None, device: str = None):
         """
@@ -41,129 +37,54 @@ class Embedder:
     @property
     def model(self) -> SentenceTransformer:
         """Lazy-load the model."""
-        if not HAS_SENTENCE_TRANSFORMERS:
-            raise ImportError(
-                "sentence-transformers not installed. "
-                "Install with: pip install sentence-transformers"
-            )
-        
         if self._model is None:
-            logger.info(f"Loading embedding model: {self.model_name}")
             self._model = SentenceTransformer(self.model_name, device=self.device)
-            logger.info(f"Embedding model loaded successfully")
-        
         return self._model
 
-    def embed(
-        self,
-        texts: Union[str, List[str]],
-        normalize: bool = True,
-        show_progress: bool = False
-    ) -> np.ndarray:
+    def embed_texts(self, texts: List[str], show_progress: bool = True) -> List[List[float]]:
         """
-        Generate embeddings for text(s).
+        Generate embeddings for a list of texts.
         
         Args:
-            texts: Single text or list of texts
-            normalize: Whether to normalize embeddings (recommended for cosine similarity)
-            show_progress: Show progress bar
+            texts: List of texts to embed
+            show_progress: Whether to show progress bar
             
         Returns:
-            numpy array of embeddings (n_texts x embedding_dim)
+            List of 384-dim embedding vectors
         """
-        if isinstance(texts, str):
-            texts = [texts]
-        
         if not texts:
-            return np.array([]).reshape(0, settings.embedding_dim)
+            return []
         
-        try:
-            embeddings = self.model.encode(
-                texts,
-                convert_to_numpy=True,
-                normalize_embeddings=normalize,
-                show_progress_bar=show_progress
-            )
-            
-            # Ensure correct dimension
-            if embeddings.shape[1] != settings.embedding_dim:
-                logger.warning(
-                    f"Expected embedding dim {settings.embedding_dim}, "
-                    f"got {embeddings.shape[1]}"
-                )
-            
-            return embeddings
-            
-        except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            raise
-
-    def embed_query(self, query: str) -> np.ndarray:
-        """
-        Generate embedding for a single query.
-        
-        Args:
-            query: Query text
-            
-        Returns:
-            1D numpy array of embedding
-        """
-        embeddings = self.embed([query], normalize=True)
-        return embeddings[0]
-
-    def embed_documents(self, documents: List[str], batch_size: int = 32) -> np.ndarray:
-        """
-        Generate embeddings for multiple documents in batches.
-        
-        Args:
-            documents: List of document texts
-            batch_size: Batch size for encoding
-            
-        Returns:
-            numpy array of embeddings
-        """
         all_embeddings = []
         
-        for i in range(0, len(documents), batch_size):
-            batch = documents[i:i + batch_size]
-            batch_embeddings = self.embed(batch, show_progress=False)
-            all_embeddings.append(batch_embeddings)
+        for i in tqdm(range(0, len(texts), self.BATCH_SIZE), desc="Embedding", disable=not show_progress):
+            batch = texts[i:i + self.BATCH_SIZE]
+            batch_embeddings = self.model.encode(
+                batch,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False
+            )
+            all_embeddings.extend(batch_embeddings.tolist())
         
-        return np.vstack(all_embeddings)
+        return all_embeddings
 
-    def similarity(
-        self,
-        query_embedding: np.ndarray,
-        document_embeddings: np.ndarray,
-        top_k: int = 5
-    ) -> tuple:
+    def embed_single(self, text: str) -> List[float]:
         """
-        Calculate cosine similarity and return top-k matches.
+        Generate embedding for a single text.
         
         Args:
-            query_embedding: Query embedding vector
-            document_embeddings: Matrix of document embeddings
-            top_k: Number of top results to return
+            text: Text to embed
             
         Returns:
-            Tuple of (indices, scores) for top-k matches
+            384-dim embedding vector
         """
-        # Normalize if not already normalized
-        if np.linalg.norm(query_embedding) != 1.0:
-            query_embedding = query_embedding / np.linalg.norm(query_embedding)
-        
-        if not np.allclose(np.linalg.norm(document_embeddings, axis=1), 1.0):
-            norms = np.linalg.norm(document_embeddings, axis=1, keepdims=True)
-            document_embeddings = document_embeddings / (norms + 1e-9)
-        
-        # Calculate cosine similarity
-        similarities = document_embeddings @ query_embedding
-        
-        # Get top-k indices
-        top_indices = np.argsort(similarities)[::-1][:top_k]
-        top_scores = similarities[top_indices]
-        
-        return top_indices, top_scores
+        embedding = self.model.encode(
+            text,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+        return embedding.tolist()
 
 
 # Global embedder instance
@@ -178,7 +99,7 @@ def get_embedder() -> Embedder:
     return _embedder
 
 
-def embed_texts(texts: List[str], **kwargs) -> np.ndarray:
+def embed_texts(texts: List[str], **kwargs) -> List[List[float]]:
     """
     Convenience function to embed texts.
     
@@ -187,22 +108,21 @@ def embed_texts(texts: List[str], **kwargs) -> np.ndarray:
         **kwargs: Additional arguments for Embedder
         
     Returns:
-        numpy array of embeddings
+        List of embedding vectors
     """
     embedder = get_embedder()
-    return embedder.embed(texts, **kwargs)
+    return embedder.embed_texts(texts, **kwargs)
 
 
-def embed_query(query: str, **kwargs) -> np.ndarray:
+def embed_single(text: str) -> List[float]:
     """
-    Convenience function to embed a query.
+    Convenience function to embed a single text.
     
     Args:
-        query: Query text
-        **kwargs: Additional arguments for Embedder
+        text: Text to embed
         
     Returns:
-        1D numpy array of embedding
+        Embedding vector
     """
     embedder = get_embedder()
-    return embedder.embed_query(query, **kwargs)
+    return embedder.embed_single(text)
