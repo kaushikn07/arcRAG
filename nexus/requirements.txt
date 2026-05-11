@@ -1,0 +1,59 @@
+# NEXUS - Agentic RAG System for Financial Document Intelligence
+# Python 3.11+
+
+# Core Dependencies
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+pgvector==0.2.4
+
+# Graph Database
+neo4j==5.16.0
+
+# Cache
+redis==5.0.1
+
+# PDF Processing
+pymupdf4llm==0.0.10
+pdfplumber==0.10.3
+
+# Embeddings
+sentence-transformers==2.3.1
+
+# Tokenization
+tiktoken==0.5.2
+
+# Guardrails / PII Detection
+presidio-analyzer==2.2.355
+presidio-anonymizer==2.2.355
+
+# NLP
+spacy==3.7.2
+en-core-web-lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.7.1/en_core_web_lg-3.7.1-py3-none-any.whl
+
+# Toxicity Detection
+detoxify==0.5.2
+
+# Evaluation
+ragas==0.1.0
+mlflow==2.9.2
+
+# Logging
+loguru==0.7.2
+
+# API Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# HTTP Client
+httpx==0.26.0
+
+# Configuration
+pydantic-settings==2.1.0
+python-dotenv==1.0.0
+
+# Additional Utilities
+numpy>=1.24.0
+pandas>=2.0.0
+pydantic>=2.5.0
+aiofiles>=23.2.1
+python-multipart>=0.0.6
