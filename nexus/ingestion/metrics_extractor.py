@@ -1,304 +1,306 @@
-"""
-Financial Metrics Extractor for NEXUS
+"""Financial metrics extractor using LLM."""
 
-Extracts structured financial metrics from document text using LLM.
-"""
-
-from typing import List, Optional, Dict, Any
-from dataclasses import dataclass
-from loguru import logger
+import asyncio
+import json
 import re
+from dataclasses import dataclass
+from typing import Optional
 
 import httpx
+from loguru import logger
+
 from config import settings
+from ingestion.parser import ParsedSection
 
 
 @dataclass
-class FinancialMetric:
+class ExtractedMetric:
     """Represents an extracted financial metric."""
+
     metric_name: str
     value: float
     unit: str
-    period: Optional[str] = None
-    company: Optional[str] = None
-    year: Optional[int] = None
-    source_section_id: Optional[int] = None
-    metadata: Dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    period: str  # annual/Q1/Q2/Q3/Q4
+    doc_id: str
+    company: str
+    year: int
+    source_section_id: Optional[str] = None
 
 
-class MetricsExtractor:
-    """
-    Extract financial metrics from document text using LLM.
-    
-    Identifies and structures key financial figures like:
-    - Revenue, Net Income, EBITDA
-    - Assets, Liabilities, Equity
-    - Cash Flow metrics
-    - Ratios (P/E, Debt/Equity, etc.)
-    """
+class FinancialMetricsExtractor:
+    """Extract financial metrics from document sections using LLM."""
 
-    def __init__(self, model: str = None):
-        """
-        Initialize the extractor.
-        
-        Args:
-            model: LLM model to use for extraction
-        """
-        self.model = model or settings.llm_model_classify
-        self.base_url = settings.openrouter_base_url
+    VALID_METRICS = {
+        "revenue",
+        "net_income",
+        "eps",
+        "operating_income",
+        "gross_profit",
+        "total_assets",
+        "total_debt",
+    }
+
+    def __init__(self):
+        self.base_url = settings.openrouter_base_url.rstrip("/")
         self.api_key = settings.openrouter_api_key
+        self.model = settings.llm_model_fast
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "HTTP-Referer": "https://github.com/nexus-rag",
+            "Content-Type": "application/json",
+        }
+        # Rate limit: max 10 concurrent requests
+        self.semaphore = asyncio.Semaphore(10)
+
+    async def _call_llm(self, prompt: str) -> str:
+        """Call OpenRouter API with the given prompt."""
+        async with self.semaphore:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                    "max_tokens": 1024,
+                }
+                try:
+                    response = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=self.headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"HTTP error from OpenRouter: {e.response.status_code} - {e.response.text}")
+                    raise
+                except Exception as e:
+                    logger.error(f"Error calling OpenRouter: {e}")
+                    raise
 
     async def extract_metrics(
-        self,
-        text: str,
-        company: Optional[str] = None,
-        year: Optional[int] = None,
-        section_id: Optional[int] = None
-    ) -> List[FinancialMetric]:
+        self, section: ParsedSection, doc_id: str, company: str, year: int
+    ) -> list[dict]:
         """
-        Extract financial metrics from text.
-        
+        Extract financial metrics from a section.
+
+        Only processes sections with content_type in ('table', 'mixed').
+
         Args:
-            text: Text to extract from
+            section: The ParsedSection to extract from
+            doc_id: Document ID
             company: Company name
             year: Fiscal year
-            section_id: Source section ID
-            
+
         Returns:
-            List of FinancialMetric objects
+            List of dicts with keys: metric_name, value, unit, period
         """
+        # Only process table or mixed content
+        if section.content_type not in ("table", "mixed"):
+            return []
+
+        # Get text content
+        text = section.raw_text
+        if section.table_data and section.table_data.get("markdown"):
+            text = f"{section.raw_text}\n\nTable:\n{section.table_data['markdown']}"
+
         if not text.strip():
             return []
 
-        prompt = self._build_prompt(text, company, year)
-        
+        prompt = (
+            "Extract financial metrics from this text. Return a JSON array of objects with keys:\n"
+            "metric_name, value (number only, in millions USD), unit, period (annual/Q1/Q2/Q3/Q4).\n"
+            "Only include: revenue, net_income, eps, operating_income, gross_profit, total_assets, total_debt.\n"
+            "Return [] if no financial metrics found. Return ONLY the JSON array.\n\n"
+            f"Company: {company}\nYear: {year}\n\nText:\n{text}"
+        )
+
         try:
             response_text = await self._call_llm(prompt)
-            metrics = self._parse_metrics(response_text, company, year, section_id)
-            
-            logger.info(f"Extracted {len(metrics)} financial metrics")
-            return metrics
-            
+
+            # Parse JSON array from response
+            response_text = response_text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+
+            metrics_data = json.loads(response_text)
+
+            if not isinstance(metrics_data, list):
+                logger.warning(f"Expected JSON array, got {type(metrics_data)}")
+                return []
+
+            result = []
+            for item in metrics_data:
+                if not isinstance(item, dict):
+                    continue
+
+                metric_name = item.get("metric_name", "").lower().replace(" ", "_").replace("-", "_")
+
+                # Filter to valid metrics only
+                if metric_name not in self.VALID_METRICS:
+                    continue
+
+                # Parse value - strip $, B, M, commas
+                value_raw = item.get("value")
+                if value_raw is None:
+                    continue
+
+                value = self._parse_numeric_value(value_raw)
+                if value is None:
+                    continue
+
+                unit = item.get("unit", "USD")
+                period = item.get("period", "annual")
+
+                # Normalize period
+                period_lower = period.lower()
+                if period_lower in ("annual", "fy", "full year", "year"):
+                    period = "annual"
+                elif period_lower in ("q1", "quarter 1", "first quarter"):
+                    period = "Q1"
+                elif period_lower in ("q2", "quarter 2", "second quarter"):
+                    period = "Q2"
+                elif period_lower in ("q3", "quarter 3", "third quarter"):
+                    period = "Q3"
+                elif period_lower in ("q4", "quarter 4", "fourth quarter"):
+                    period = "Q4"
+                else:
+                    period = "annual"
+
+                result.append(
+                    {
+                        "metric_name": metric_name,
+                        "value": value,
+                        "unit": unit,
+                        "period": period,
+                        "doc_id": doc_id,
+                        "company": company,
+                        "year": year,
+                        "source_section_id": section.section_id,
+                    }
+                )
+
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON from LLM response: {e}. Response: {response_text[:200]}")
+            return []
         except Exception as e:
             logger.error(f"Error extracting metrics: {e}")
             return []
 
-    def _build_prompt(
-        self,
-        text: str,
-        company: Optional[str],
-        year: Optional[int]
-    ) -> str:
-        """Build the extraction prompt."""
-        # Truncate if too long
-        max_chars = 4000
-        if len(text) > max_chars:
-            text = text[:max_chars] + "..."
-        
-        context = ""
-        if company:
-            context += f"Company: {company}\n"
-        if year:
-            context += f"Fiscal Year: {year}\n"
-        
-        prompt = f"""You are an expert financial analyst. Extract ALL financial metrics from the following text.
+    def _parse_numeric_value(self, value_raw) -> Optional[float]:
+        """
+        Parse a numeric value, stripping $, B, M, commas.
 
-{context}
-Focus on these metric types:
-- Revenue, Net Income, Operating Income, EBITDA, EBIT
-- Total Assets, Current Assets, Non-current Assets
-- Total Liabilities, Current Liabilities, Long-term Debt
-- Shareholders' Equity, Retained Earnings
-- Cash Flow from Operations, Investing, Financing
-- EPS, P/E Ratio, Debt-to-Equity, Current Ratio
-- Any other numerical financial figures with units
+        Args:
+            value_raw: Raw value (string or number)
 
-Text:
-{text}
+        Returns:
+            Float value in millions USD, or None if parsing fails
+        """
+        if isinstance(value_raw, (int, float)):
+            return float(value_raw)
 
-Output format (JSON array):
-[
-    {{
-        "metric_name": "Revenue",
-        "value": 15000000000,
-        "unit": "USD",
-        "period": "FY2023"
-    }},
-    ...
-]
+        if not isinstance(value_raw, str):
+            return None
 
-Only output valid JSON. If no metrics found, output [].
+        # Strip whitespace
+        value_str = value_raw.strip()
 
-Metrics:"""
-        
-        return prompt
+        # Check for billions/millions suffix
+        multiplier = 1.0
+        value_lower = value_str.lower()
+        if "billion" in value_lower or "b" in value_lower:
+            multiplier = 1000.0  # Convert to millions
+        elif "million" in value_lower or "m" in value_lower:
+            multiplier = 1.0  # Already in millions
 
-    async def _call_llm(self, prompt: str) -> str:
-        """Call the LLM API."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/nexus-rag",
-            "X-Title": "NEXUS"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a precise financial data extractor. Output only valid JSON."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.1
-        }
-        
-        url = f"{self.base_url}/chat/completions"
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+        # Remove non-numeric characters except digits, dots, minus, commas
+        cleaned = re.sub(r"[^\d.\-,]", "", value_str)
+        cleaned = cleaned.replace(",", "")
 
-    def _parse_metrics(
-        self,
-        response_text: str,
-        company: Optional[str],
-        year: Optional[int],
-        section_id: Optional[int]
-    ) -> List[FinancialMetric]:
-        """Parse metrics from LLM response."""
-        import json
-        
-        metrics = []
-        
-        # Try to extract JSON
         try:
-            # Find JSON array in response
-            match = re.search(r'\[.*\]', response_text, re.DOTALL)
-            if match:
-                json_str = match.group(0)
-                data = json.loads(json_str)
-                
-                for item in data:
-                    if isinstance(item, dict):
-                        metric = FinancialMetric(
-                            metric_name=item.get('metric_name', 'Unknown'),
-                            value=float(item.get('value', 0)),
-                            unit=item.get('unit', 'USD'),
-                            period=item.get('period'),
-                            company=company,
-                            year=year,
-                            source_section_id=section_id,
-                            metadata={'raw_response': response_text}
-                        )
-                        metrics.append(metric)
-                        
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse JSON from LLM response")
-            
-            # Fallback: try regex patterns
-            metrics = self._regex_extract(response_text, company, year, section_id)
-        
-        return metrics
+            value = float(cleaned) * multiplier
+            return value
+        except (ValueError, TypeError):
+            return None
 
-    def _regex_extract(
-        self,
-        text: str,
-        company: Optional[str],
-        year: Optional[int],
-        section_id: Optional[int]
-    ) -> List[FinancialMetric]:
-        """Fallback regex-based extraction."""
-        metrics = []
-        
-        # Common financial metric patterns
-        patterns = [
-            (r'(?:revenue|sales)[^\d]*([\d,\.]+)\s*(million|billion|USD|\$)?', 'Revenue'),
-            (r'(?:net income|net profit)[^\d]*([\d,\.]+)\s*(million|billion|USD|\$)?', 'Net Income'),
-            (r'(?:EBITDA)[^\d]*([\d,\.]+)\s*(million|billion|USD|\$)?', 'EBITDA'),
-            (r'(?:total assets)[^\d]*([\d,\.]+)\s*(million|billion|USD|\$)?', 'Total Assets'),
-            (r'(?:total liabilities)[^\d]*([\d,\.]+)\s*(million|billion|USD|\$)?', 'Total Liabilities'),
-        ]
-        
-        for pattern, default_name in patterns:
-            matches = re.findall(pattern, text, re.IGNORECASE)
-            for match in matches:
+    async def extract_and_store_all(
+        self, sections: list[ParsedSection], doc_id: str, company: str, year: int
+    ) -> int:
+        """
+        Extract metrics from all sections and store in database.
+
+        Args:
+            sections: List of ParsedSection objects
+            doc_id: Document ID
+            company: Company name
+            year: Fiscal year
+
+        Returns:
+            Total number of metrics stored
+        """
+        from db.neon import execute
+
+        total_stored = 0
+
+        # Process sections
+        tasks = []
+        for section in sections:
+            task = self.extract_metrics(section, doc_id, company, year)
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Store results
+        for section, result in zip(sections, results):
+            if isinstance(result, Exception):
+                logger.error(f"Error processing section {section.section_id}: {result}")
+                continue
+
+            metrics = result
+            for metric in metrics:
+                insert_query = """
+                INSERT INTO financial_metrics 
+                (metric_id, doc_id, company, year, period, metric_name, value, unit, source_section_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (metric_id) DO NOTHING
+                """
+                # Generate deterministic metric_id
+                import hashlib
+
+                metric_id = hashlib.sha256(
+                    f"{doc_id}:{metric['metric_name']}:{metric['period']}".encode()
+                ).hexdigest()[:16]
+
                 try:
-                    value_str, unit_str = match
-                    
-                    # Parse value
-                    value = float(value_str.replace(',', ''))
-                    
-                    # Parse unit
-                    unit = 'USD'
-                    multiplier = 1
-                    if unit_str:
-                        unit_str = unit_str.lower()
-                        if 'million' in unit_str:
-                            multiplier = 1_000_000
-                        elif 'billion' in unit_str:
-                            multiplier = 1_000_000_000
-                        if '$' in unit_str or 'usd' in unit_str:
-                            unit = 'USD'
-                    
-                    value *= multiplier
-                    
-                    metrics.append(FinancialMetric(
-                        metric_name=default_name,
-                        value=value,
-                        unit=unit,
-                        company=company,
-                        year=year,
-                        source_section_id=section_id
-                    ))
-                    
-                except (ValueError, TypeError):
-                    continue
-        
-        return metrics
+                    await execute(
+                        insert_query,
+                        metric_id,
+                        metric["doc_id"],
+                        metric["company"],
+                        metric["year"],
+                        metric["period"],
+                        metric["metric_name"],
+                        metric["value"],
+                        metric["unit"],
+                        metric["source_section_id"],
+                    )
+                    total_stored += 1
+                except Exception as e:
+                    logger.error(f"Failed to store metric {metric_id}: {e}")
+
+        return total_stored
 
 
-# Global extractor instance
-_extractor: Optional[MetricsExtractor] = None
-
-
-def get_extractor() -> MetricsExtractor:
-    """Get the global metrics extractor instance."""
-    global _extractor
-    if _extractor is None:
-        _extractor = MetricsExtractor()
-    return _extractor
-
-
-async def extract_financial_metrics(
-    text: str,
-    company: Optional[str] = None,
-    year: Optional[int] = None,
-    **kwargs
-) -> List[FinancialMetric]:
-    """
-    Convenience function to extract financial metrics.
-    
-    Args:
-        text: Text to extract from
-        company: Company name
-        year: Fiscal year
-        **kwargs: Additional arguments
-        
-    Returns:
-        List of FinancialMetric objects
-    """
-    extractor = get_extractor()
-    return await extractor.extract_metrics(text, company, year, **kwargs)
+# Convenience function
+async def extract_metrics(section: ParsedSection, doc_id: str, company: str, year: int) -> list[dict]:
+    """Extract financial metrics from a section."""
+    extractor = FinancialMetricsExtractor()
+    return await extractor.extract_metrics(section, doc_id, company, year)

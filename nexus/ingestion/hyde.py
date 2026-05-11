@@ -1,226 +1,192 @@
-"""
-HyDE (Hypothetical Document Embeddings) for NEXUS
+"""HyDE (Hypothetical Document Embeddings) question generator."""
 
-Generates hypothetical questions from chunks to improve retrieval.
-"""
-
-from typing import List, Optional, Dict, Any
+import asyncio
+import hashlib
+import json
 from dataclasses import dataclass
-from loguru import logger
+from typing import Optional
 
 import httpx
+from loguru import logger
+
 from config import settings
+from ingestion.chunker import Chunk
 
 
 @dataclass
 class HypotheticalQuestion:
     """Represents a HyDE-generated question."""
+    q_id: str
+    chunk_id: str
+    doc_id: str
     question_text: str
-    chunk_id: Optional[int] = None
-    doc_id: Optional[int] = None
-    metadata: Dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
+    embedding: Optional[list[float]] = None
 
 
 class HyDEGenerator:
-    """
-    Generate hypothetical questions from text chunks using LLM.
-    
-    HyDE improves retrieval by generating questions that the chunk
-    could answer, then embedding those questions for similarity search.
-    """
+    """Generate hypothetical questions for chunks using LLM."""
 
-    def __init__(self, model: str = None):
-        """
-        Initialize HyDE generator.
-        
-        Args:
-            model: LLM model to use for generation
-        """
-        self.model = model or settings.llm_model_fast
-        self.base_url = settings.openrouter_base_url
+    def __init__(self):
+        self.base_url = settings.openrouter_base_url.rstrip("/")
         self.api_key = settings.openrouter_api_key
+        self.model = settings.llm_model_fast
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "HTTP-Referer": "https://github.com/nexus-rag",
+            "Content-Type": "application/json",
+        }
+        # Rate limit: max 10 concurrent requests
+        self.semaphore = asyncio.Semaphore(10)
 
-    async def generate_questions(
-        self,
-        chunk_text: str,
-        num_questions: int = 3,
-        chunk_id: Optional[int] = None,
-        doc_id: Optional[int] = None
-    ) -> List[HypotheticalQuestion]:
+    async def _call_llm(self, prompt: str) -> str:
+        """Call OpenRouter API with the given prompt."""
+        async with self.semaphore:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 512,
+                }
+                try:
+                    response = await client.post(
+                        f"{self.base_url}/chat/completions",
+                        headers=self.headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    return data["choices"][0]["message"]["content"].strip()
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"HTTP error from OpenRouter: {e.response.status_code} - {e.response.text}")
+                    raise
+                except Exception as e:
+                    logger.error(f"Error calling OpenRouter: {e}")
+                    raise
+
+    async def generate_hyde_questions(self, chunk_text: str, chunk_id: str) -> list[str]:
         """
-        Generate hypothetical questions from a chunk.
-        
+        Generate 3-5 hypothetical questions that the chunk text answers.
+
         Args:
-            chunk_text: Text of the chunk
-            num_questions: Number of questions to generate
-            chunk_id: Optional chunk identifier
-            doc_id: Optional document identifier
-            
-        Returns:
-            List of HypotheticalQuestion objects
-        """
-        if not chunk_text.strip():
-            return []
+            chunk_text: The text of the chunk
+            chunk_id: The ID of the chunk
 
-        prompt = self._build_prompt(chunk_text, num_questions)
-        
+        Returns:
+            List of question strings (each ending with '?')
+        """
+        prompt = (
+            "Generate 3-5 specific questions that this text passage directly answers. "
+            "Return only a JSON array of question strings. No preamble.\n\n"
+            f"Text passage:\n{chunk_text}"
+        )
+
         try:
             response_text = await self._call_llm(prompt)
-            questions = self._parse_questions(response_text)
-            
-            return [
-                HypotheticalQuestion(
-                    question_text=q,
-                    chunk_id=chunk_id,
-                    doc_id=doc_id,
-                    metadata={"source_chunk_length": len(chunk_text)}
-                )
-                for q in questions[:num_questions]
-            ]
-            
+
+            # Try to parse JSON array from response
+            # Handle cases where response might have markdown code blocks
+            response_text = response_text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+
+            questions = json.loads(response_text)
+
+            if not isinstance(questions, list):
+                logger.warning(f"Expected JSON array, got {type(questions)}: {response_text[:100]}")
+                return []
+
+            # Filter: keep only strings that end with '?'
+            valid_questions = []
+            for q in questions:
+                if isinstance(q, str) and q.strip().endswith("?"):
+                    valid_questions.append(q.strip())
+                elif isinstance(q, str):
+                    # Add '?' if missing
+                    valid_questions.append(q.strip() + "?")
+
+            return valid_questions
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse JSON from LLM response: {e}. Response: {response_text[:200]}")
+            return []
         except Exception as e:
             logger.error(f"Error generating HyDE questions: {e}")
             return []
 
-    async def generate_questions_batch(
-        self,
-        chunks: List[Dict[str, Any]],
-        num_questions_per_chunk: int = 3
-    ) -> List[HypotheticalQuestion]:
+    async def generate_and_store_all(self, chunks: list[Chunk]) -> int:
         """
-        Generate questions for multiple chunks.
-        
+        Generate HyDE questions for all chunks and store in database.
+
         Args:
-            chunks: List of dicts with 'text', 'chunk_id', 'doc_id' keys
-            num_questions_per_chunk: Questions per chunk
-            
+            chunks: List of Chunk objects
+
         Returns:
-            List of all HypotheticalQuestion objects
+            Total number of questions stored
         """
-        all_questions = []
-        
-        for chunk in chunks:
-            questions = await self.generate_questions(
-                chunk_text=chunk.get('text', ''),
-                num_questions=num_questions_per_chunk,
-                chunk_id=chunk.get('chunk_id'),
-                doc_id=chunk.get('doc_id')
-            )
-            all_questions.extend(questions)
-        
-        logger.info(f"Generated {len(all_questions)} hypothetical questions")
-        return all_questions
+        from db.neon import execute
 
-    def _build_prompt(self, text: str, num_questions: int) -> str:
-        """Build the prompt for question generation."""
-        # Truncate if too long
-        max_chars = 2000
-        if len(text) > max_chars:
-            text = text[:max_chars] + "..."
-        
-        prompt = f"""You are an expert at generating relevant questions from financial document excerpts.
+        total_stored = 0
 
-Given the following text excerpt from a financial document, generate exactly {num_questions} distinct questions that this text could answer.
+        # Process in batches of 20 to avoid overwhelming the system
+        batch_size = 20
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i : i + batch_size]
+            tasks = []
 
-Focus on:
-- Financial metrics and figures mentioned
-- Company performance indicators
-- Strategic initiatives or business developments
-- Risk factors or challenges
-- Forward-looking statements
+            for chunk in batch:
+                task = self._process_chunk(chunk)
+                tasks.append(task)
 
-Text excerpt:
-{text}
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-Generate exactly {num_questions} questions, one per line, without numbering or bullets. Only output the questions, nothing else.
+            # Store results
+            insert_queries = []
+            insert_args = []
 
-Questions:"""
-        
-        return prompt
+            for chunk, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error processing chunk {chunk.chunk_id}: {result}")
+                    continue
 
-    async def _call_llm(self, prompt: str) -> str:
-        """Call the LLM API."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/nexus-rag",
-            "X-Title": "NEXUS"
-        }
-        
-        payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            "max_tokens": 500,
-            "temperature": 0.7
-        }
-        
-        url = f"{self.base_url}/chat/completions"
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
-            
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+                questions = result
+                for question_text in questions:
+                    q_id = hashlib.sha256(f"{chunk.chunk_id}:{question_text}".encode()).hexdigest()[:16]
+                    insert_queries.append(
+                        """
+                        INSERT INTO hypothetical_questions (q_id, chunk_id, doc_id, question_text, embedding)
+                        VALUES ($1, $2, $3, $4, NULL)
+                        ON CONFLICT (q_id) DO NOTHING
+                        """
+                    )
+                    insert_args.append((q_id, chunk.chunk_id, chunk.doc_id, question_text))
 
-    def _parse_questions(self, text: str) -> List[str]:
-        """Parse generated questions from LLM response."""
-        questions = []
-        
-        lines = text.strip().split('\n')
-        for line in lines:
-            line = line.strip()
-            # Remove numbering/bullets
-            line = line.lstrip('1234567890.-*•')
-            line = line.strip()
-            
-            if line and line.endswith('?'):
-                questions.append(line)
-        
-        # If parsing failed, try to extract any sentence with question mark
-        if not questions:
-            import re
-            questions = re.findall(r'[^.!?]+\?', text)
-        
-        return questions
+            # Batch insert
+            if insert_queries:
+                # Use executemany-style approach
+                for query, args in zip(insert_queries, insert_args):
+                    try:
+                        await execute(query, *args)
+                        total_stored += 1
+                    except Exception as e:
+                        logger.error(f"Failed to store question {args[0]}: {e}")
+
+            logger.info(f"Processed batch {i // batch_size + 1}/{(len(chunks) + batch_size - 1) // batch_size}")
+
+        return total_stored
+
+    async def _process_chunk(self, chunk: Chunk) -> list[str]:
+        """Process a single chunk and return its questions."""
+        return await self.generate_hyde_questions(chunk.text, chunk.chunk_id)
 
 
-# Global HyDE generator instance
-_hyde_generator: Optional[HyDEGenerator] = None
-
-
-def get_hyde_generator() -> HyDEGenerator:
-    """Get the global HyDE generator instance."""
-    global _hyde_generator
-    if _hyde_generator is None:
-        _hyde_generator = HyDEGenerator()
-    return _hyde_generator
-
-
-async def generate_hypothetical_questions(
-    text: str,
-    num_questions: int = 3,
-    **kwargs
-) -> List[HypotheticalQuestion]:
-    """
-    Convenience function to generate hypothetical questions.
-    
-    Args:
-        text: Text to generate questions from
-        num_questions: Number of questions to generate
-        **kwargs: Additional arguments
-        
-    Returns:
-        List of HypotheticalQuestion objects
-    """
-    generator = get_hyde_generator()
-    return await generator.generate_questions(text, num_questions, **kwargs)
+# Convenience function
+async def generate_hyde_questions(chunk_text: str, chunk_id: str) -> list[str]:
+    """Generate HyDE questions for a chunk."""
+    generator = HyDEGenerator()
+    return await generator.generate_hyde_questions(chunk_text, chunk_id)
