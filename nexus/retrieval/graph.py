@@ -1,179 +1,86 @@
-"""
-Graph Retrieval for NEXUS
-
-Retrieves information from Neo4j knowledge graph.
-"""
-
-from typing import List, Dict, Any, Optional
-from loguru import logger
-
-from ingestion.graph_builder import GraphBuilder
+"""Graph retrieval from Neo4j knowledge graph."""
+from typing import List, Optional
+from neo4j import AsyncGraphDatabase
+from config import settings
 
 
-class GraphRetriever:
+async def graph_retrieve(
+    entities: List[str],
+    query_type: str,
+    max_results: int = 20
+) -> List[str]:
     """
-    Retrieve information from the Neo4j knowledge graph.
-    
-    Supports queries like:
-    - Get all metrics for a company
-    - Compare metrics across years
-    - Find related documents
-    """
-
-    def __init__(self):
-        """Initialize the graph retriever."""
-        self.graph = GraphBuilder()
-
-    async def retrieve_metrics(
-        self,
-        company: str,
-        year: Optional[int] = None,
-        metric_names: Optional[List[str]] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Retrieve financial metrics from the graph.
-        
-        Args:
-            company: Company name
-            year: Optional year filter
-            metric_names: Optional list of specific metrics
-            
-        Returns:
-            List of metric dicts
-        """
-        await self.graph.connect()
-        
-        try:
-            results = await self.graph.query_metrics_by_company(
-                company, year, metric_names
-            )
-            
-            return [
-                {
-                    "name": r["name"],
-                    "value": float(r["value"]),
-                    "unit": r["unit"],
-                    "year": r["year"],
-                    "period": r["period"],
-                    "source": "graph"
-                }
-                for r in results
-            ]
-        finally:
-            await self.graph.close()
-
-    async def retrieve_company_info(self, company: str) -> Dict[str, Any]:
-        """
-        Retrieve company information and relationships.
-        
-        Args:
-            company: Company name
-            
-        Returns:
-            Company info dict with relationships
-        """
-        await self.graph.connect()
-        
-        try:
-            relationships = await self.graph.get_company_relationships(company)
-            
-            # Aggregate by relationship type
-            by_type = {}
-            for rel in relationships:
-                rel_type = rel["relationship"]
-                if rel_type not in by_type:
-                    by_type[rel_type] = []
-                by_type[rel_type].append(rel["connected_properties"])
-            
-            return {
-                "company": company,
-                "relationships": by_type,
-                "document_count": len(by_type.get("PART_OF_DOCUMENT", [])),
-                "metric_count": len(by_type.get("BELONGS_TO_COMPANY", []))
-            }
-        finally:
-            await self.graph.close()
-
-    async def search_documents(
-        self,
-        company: Optional[str] = None,
-        year: Optional[int] = None,
-        doc_type: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Search for documents in the graph.
-        
-        Args:
-            company: Optional company filter
-            year: Optional year filter
-            doc_type: Optional document type filter
-            
-        Returns:
-            List of document dicts
-        """
-        await self.graph.connect()
-        
-        conditions = []
-        params = {}
-        
-        if company:
-            conditions.append("d.company = $company")
-            params["company"] = company
-        
-        if year:
-            conditions.append("d.year = $year")
-            params["year"] = year
-        
-        if doc_type:
-            conditions.append("d.doc_type = $doc_type")
-            params["doc_type"] = doc_type
-        
-        where_clause = "WHERE " + " AND ".join(conditions) if conditions else ""
-        
-        query = f"""
-        MATCH (d:Document)
-        {where_clause}
-        RETURN d.doc_id AS doc_id,
-               d.company AS company,
-               d.year AS year,
-               d.doc_type AS doc_type,
-               d.filename AS filename,
-               d.page_count AS page_count
-        ORDER BY d.year DESC, d.doc_id
-        """
-        
-        try:
-            results = await self.graph.execute(query, params if params else None)
-            return results
-        finally:
-            await self.graph.close()
-
-
-# Global retriever instance
-_graph_retriever: Optional[GraphRetriever] = None
-
-
-def get_graph_retriever() -> GraphRetriever:
-    """Get the global graph retriever instance."""
-    global _graph_retriever
-    if _graph_retriever is None:
-        _graph_retriever = GraphRetriever()
-    return _graph_retriever
-
-
-async def retrieve_from_graph(
-    company: str,
-    **kwargs
-) -> List[Dict[str, Any]]:
-    """
-    Convenience function for graph retrieval.
+    Retrieve relationships from Neo4j graph.
     
     Args:
-        company: Company name
-        **kwargs: Additional arguments
-        
+        entities: List of entity names to search for
+        query_type: 'relational' for 1-hop, 'multi_hop' for up to 3 hops
+        max_results: Maximum number of results (LIMIT in Cypher)
+    
     Returns:
-        List of results
+        List of formatted strings: "EntityA RELATION_TYPE EntityB (source: doc_id, year: year)"
     """
-    retriever = get_graph_retriever()
-    return await retriever.retrieve_metrics(company, **kwargs)
+    if not entities:
+        return []
+    
+    driver = AsyncGraphDatabase.driver(
+        settings.neo4j_uri,
+        auth=(settings.neo4j_user, settings.neo4j_password)
+    )
+    
+    results = []
+    
+    try:
+        async with driver.session() as session:
+            if query_type == 'relational':
+                # 1-hop query
+                cypher = """
+                MATCH (a)-[r]-(b)
+                WHERE a.name IN $entities
+                RETURN a.name AS from_entity, 
+                       type(r) AS relation_type, 
+                       b.name AS to_entity,
+                       a.doc_id AS doc_id,
+                       a.year AS year
+                LIMIT $limit
+                """
+            else:
+                # Multi-hop query (up to 3 hops)
+                cypher = """
+                MATCH path=(a)-[*1..3]-(b)
+                WHERE a.name IN $entities
+                WITH a, b, relationships(path) AS rels
+                UNWIND rels AS r
+                RETURN a.name AS from_entity,
+                       type(r) AS relation_type,
+                       b.name AS to_entity,
+                       a.doc_id AS doc_id,
+                       a.year AS year
+                LIMIT $limit
+                """
+            
+            result = await session.run(
+                cypher,
+                entities=entities,
+                limit=max_results
+            )
+            
+            async for record in result:
+                from_entity = record["from_entity"]
+                relation_type = record["relation_type"]
+                to_entity = record["to_entity"]
+                doc_id = record.get("doc_id", "unknown")
+                year = record.get("year", "unknown")
+                
+                formatted = f"{from_entity} {relation_type} {to_entity} (source: {doc_id}, year: {year})"
+                results.append(formatted)
+    
+    except Exception as e:
+        # Log error but return empty list - graph is non-blocking
+        print(f"Graph retrieval error: {e}")
+        results = []
+    
+    finally:
+        await driver.close()
+    
+    return results
